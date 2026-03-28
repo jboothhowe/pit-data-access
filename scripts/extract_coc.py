@@ -67,11 +67,11 @@ def extract_coc_row(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame | None:
     return row
 
 
-def infer_year(sheet_name: str) -> str:
-    """Extract a 4-digit year from the sheet name if present, else use the sheet name."""
+def infer_year(sheet_name: str) -> str | None:
+    """Extract a 4-digit year from the sheet name, or None if no year is found."""
     import re
     match = re.search(r"\b(19|20)\d{2}\b", sheet_name)
-    return match.group(0) if match else sheet_name
+    return match.group(0) if match else None
 
 
 def main():
@@ -79,6 +79,7 @@ def main():
         print("Usage: python extract_coc.py <input_file.xlsb> [output_file.xlsx]")
         sys.exit(1)
 
+    # sys.argv looks like [program_name, input_file, [optional output_file]]
     input_path = sys.argv[1]
     output_path = sys.argv[2] if len(sys.argv) > 2 else os.path.join(
         os.path.dirname(input_path), "ca502_extract.xlsx"
@@ -95,13 +96,18 @@ def main():
 
     rows = []
     for sheet_name, df in sheets.items():
+        year = infer_year(sheet_name)
+        if year is None:
+            print(f"  [{sheet_name}] Not a year sheet, skipping")
+            continue
+
         if df.empty:
             print(f"  [{sheet_name}] Empty sheet, skipping")
             continue
 
         row = extract_coc_row(df, sheet_name)
         if row is not None:
-            row.insert(0, "Year", infer_year(sheet_name))
+            row.insert(0, "Year", year)
             rows.append(row)
 
     if not rows:
