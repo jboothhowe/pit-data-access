@@ -229,8 +229,7 @@ All rows count persons except rows derived from `Homeless Family Households` sou
 **Year coverage:**
 - 2007–2012: No age data (all age columns null in source).
 - 2013–2022: Only `Under 18` (17), `Age 18 to 24` (24), and `Over 24` (110) populated. `Over 24` is the sole 25+ representation for these years and is retained.
-- 2023: Only granular ages (34–110) populated; `Over 24` is null.
-- 2024: Granular ages populated; `Over 24` is also populated but is confirmed equal to their sum and is therefore excluded.
+- 2023–2024: Granular ages (34–110) populated. `Over 24` is also populated in both years but maps to the same `age_upper=110` as `Over 64`, producing a duplicate row. Excluded for year ≥ 2023.
 
 **Consequence:** In years 2013–2022, `age_upper = 110` means "ages 25 and older (no finer breakdown available)." In 2023+, `age_upper = 110` means "ages 65 and older." These are different intervals. The `source_column` field distinguishes them; alternatively a query can filter `year <= 2022` vs `year >= 2023` when `age_upper = 110`.
 
@@ -331,7 +330,7 @@ white
 |---|---|---|---|
 | `Under 18` | `17` | 0 | 2013–2024 (null 2007–2012) |
 | `Age 18 to 24` | `24` | 18 | 2013–2024 (null 2007–2012) |
-| `Over 24` | `110` | 25 | 2013–2022 retained; **excluded 2024** |
+| `Over 24` | `110` | 25 | 2013–2022 retained; **excluded 2023–2024** |
 | `Age 25 to 34` | `34` | 25 | 2023–2024 only |
 | `Age 35 to 44` | `44` | 35 | 2023–2024 only |
 | `Age 45 to 54` | `54` | 45 | 2023–2024 only |
@@ -407,7 +406,7 @@ After applying all exclusion rules (§9) and adopting the unbundled dimension mo
 
 ### 5.1 `Over 24` age range — resolved
 
-`Over 24` coexists with granular adult ages in 2024 only, where it is confirmed redundant (sum of Age 25–34 through Over 64). It is the sole 25+ representation for 2013–2022 and is retained for those years. Rows with `age_upper = 110` and `year <= 2022` represent "ages 25+" while the same value in `year >= 2023` represents "ages 65+". The `source_column` field makes this unambiguous. Consumers grouping across years at `age_upper = 110` should be aware of the different intervals.
+`Over 24` coexists with granular adult ages in **both 2023 and 2024** (not 2024 only as originally noted). Both map to `age_upper = 110`, which would produce a duplicate row — so `Over 24` is excluded for year ≥ 2023. It is the sole 25+ representation for 2013–2022 and is retained for those years. Rows with `age_upper = 110` and `year <= 2022` represent "ages 25+" while the same value in `year >= 2023` represents "ages 65+". The `source_column` field makes this unambiguous. Consumers grouping across years at `age_upper = 110` should be aware of the different intervals.
 
 ### 5.2 `Sheltered SH Homeless People in Families` — column absent
 

@@ -3,6 +3,9 @@
 # Python virtual environment
 .venv/
 
+# NPM
+node_modules
+
 # Secrets
 .env*
 
