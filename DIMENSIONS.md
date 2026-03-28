@@ -6,100 +6,243 @@
 
 ---
 
+## Design principles
+
+1. Every row represents a maximally disaggregated, atomic count for a specific combination of dimensions.
+2. Every dimension is itself maximally atomic — categories that are genuinely separate facts about a person live in separate columns, even when the data does not support combining them. Supported combinations are expressed via dimension set constraints, not by collapsing facts into a single compound column.
+3. Null means "not disaggregated in source data for this combination" — never "unknown."
+4. A missing row means "not reported for this year" — never "zero." Many dimension combinations are only available for a subset of years (e.g. granular age buckets only exist for 2023–2024; gender/race/youth breakdowns are absent for 2007–2012; chronic data begins around 2013). When a source column is null for a given year, **do not insert a row with count = 0** — simply omit the row. Consumers should treat the absence of a row as "data not available" and avoid inferring a zero count.
+
+This replaces the original monolithic `household` enum with a set of boolean flags, and replaces the original combined `race` column (which conflated race identity and Hispanic ethnicity) with separate `race` and `hispanic` columns.
+
+---
+
+## Feedback evaluation (COMMENTS-ON-DIMENSIONS-1.md)
+
+### Accepted: unbundle household into atomic dimensions
+
+The original `household` text enum packed 14 semantically distinct facts into a single column. The source data supports clean decomposition:
+
+- `in_family` (boolean): individual vs. in-family partition — accepted as-is.
+- `veteran` (boolean): accepted as-is.
+- `unaccompanied_youth` + `age` (reusing existing age column): accepted — see §1.4.
+- `parenting_youth` + `age` (reusing existing age column): accepted — see §1.5.
+- `children_of_parenting_youth` (boolean): accepted — see §1.6.
+- `chronic` (boolean): accepted — see §1.7.
+- `full_household → count_unit`: accepted as concept; renamed to `count_unit` (text: `'person'`/`'household'`) for clarity, which was already proposed in the prior schema. The `family_households` source rows become `in_family=true, count_unit='household'`.
+
+### Accepted: reuse age column for youth age ranges
+
+The source data provides `Unaccompanied Youth Under 18` and `Unaccompanied Youth Age 18-24` as distinct columns. Confirmed: `under_18 + 18–24 = Under-25 total` for all spot-checked years (ES 2021: 8+58=66; 2024: 15+71=86; parenting youth 2024: verified similarly). The Under-25 aggregate rows (`unaccompanied_youth` and `parenting_youth` with no sub-dimension) are therefore redundant and excluded (new rule R6). Retained rows use the existing `age_upper` column to encode the 17 and 24 bounds.
+
+### Accepted: race and hispanic as separate columns
+
+The source uses a "race_only" / "race_and_hispanic" decomposition. These map cleanly to a two-column model: `race` (the racial identity) and `hispanic` (boolean for Hispanic/Latina/e/o identification). `hispanic` is removed from the race enum entirely. See §1.11.
+
+### Accepted: age range handling for early years (§5.1 resolution)
+
+`Over 24` is retained as a real data row for 2013–2022, where it is the sole representation of everyone aged 25+. It is excluded as a redundant aggregate in 2024, where granular age buckets also exist (verified: ES 2024 Over 24 = sum of Age 25–34 through Over 64). This resolves the anomaly without data loss.
+
+### Rejected / clarified: `accompanied_youth: true/null`
+
+This flag does not map to any source column. In standard HUD PIT terminology, "accompanied" youth refers to youth who are with a parent or guardian — which is not a reported category in this dataset. The closest source category is `Homeless Children of Parenting Youth`, which counts the children (likely <18) living with their homeless youth parents. This is represented as `children_of_parenting_youth` (boolean). If the intent was to refer to this population, the proposed boolean is adopted under that name.
+
+Source: https://www.hud.gov/sites/dfiles/OCHCO/documents/2023-11cpdn.pdf
+
+### Note: `chronic: true/false/null` and derived complements
+
+`false` does not appear in the source data — only chronically-homeless-positive populations are reported. However, `chronic=false` rows are **derived** by subtracting the chronic count from the corresponding total individual/family count for the same shelter type (see §10). So `false` does appear in the final fact table, just not as a source column.
+
+---
+
 ## 1. Dimension Definitions
 
-The following dimensions are encoded in source column names. Non-demographic metadata columns (`Year`, `CoC Number`, `CoC Name`, `CoC Category`, `Count Types`) are excluded from analysis.
+Non-demographic metadata columns (`Year`, `CoC Number`, `CoC Name`, `CoC Category`, `Count Types`) are excluded from analysis.
 
 ### 1.1 Shelter Type
 
-**Narrow column name:** `shelter`
-**Data type:** `text` (enum)
-**Null meaning:** not applicable (every row has a shelter value)
-
-Source column prefix → normalized enum value:
+**Column name:** `shelter`
+**Data type:** `text` (enum), NOT NULL
+**Null meaning:** N/A — every retained row has a shelter value
 
 | Source prefix | Normalized value | Notes |
 |---|---|---|
-| `Overall ...` | `overall` | Aggregate of all shelter types — **redundant** |
-| `Sheltered Total ...` | `sheltered_total` | Aggregate of ES + TH + SH — **redundant** |
-| `Sheltered ES ...` | `es` | Emergency shelter — **atomic** |
-| `Sheltered TH ...` | `th` | Transitional housing — **atomic** |
-| `Sheltered SH ...` | `sh` | Safe haven — **atomic** |
-| `Unsheltered ...` | `unsheltered` | Unsheltered — **atomic** |
+| `Overall ...` | *(excluded)* | Aggregate of all shelter types — redundant |
+| `Sheltered Total ...` | *(excluded)* | Aggregate of ES + TH + SH — redundant |
+| `Sheltered ES ...` | `es` | Emergency shelter — atomic |
+| `Sheltered TH ...` | `th` | Transitional housing — atomic |
+| `Sheltered SH ...` | `sh` | Safe haven — atomic |
+| `Unsheltered ...` | `unsheltered` | Unsheltered — atomic |
 
-Only the four **atomic** shelter values (`es`, `th`, `sh`, `unsheltered`) appear in retained rows. The `overall` and `sheltered_total` values appear only in redundant aggregate columns.
+Only `es`, `th`, `sh`, `unsheltered` appear in retained rows.
 
 ---
 
-### 1.2 Household Type
+### 1.2 In-Family Status
 
-**Narrow column name:** `household`
-**Data type:** `text` (enum), nullable
-**Null meaning:** column is not filtered by household type (the row covers all household types combined)
+**Column name:** `in_family`
+**Data type:** `boolean`, nullable
+**Null meaning:** count is not disaggregated by family status (e.g. veteran or youth cross-cuts)
 
-Source household phrase (appears after the shelter prefix in base column name) → normalized enum:
+| Source phrase | Value |
+|---|---|
+| `Homeless Individuals` | `false` |
+| `Homeless People in Families` | `true` |
+| `Homeless Family Households` | `true` (but `count_unit = 'household'` — placed in `shelter+family_unit`, not `shelter+in_family`) |
+| `Chronically Homeless Individuals` | `false` |
+| `Chronically Homeless People in Families` | `true` |
+| Any veteran / youth / children_of_parenting_youth row | `null` |
 
-| Source phrase | Normalized value | Notes |
+**Note:** `individual` and `family` person rows (in_family=false/true, count_unit='person') are an exhaustive partition of the total for any given shelter type. Confirmed spot-checks (2021–2024): `es_individual + es_family = es_total`, same for TH and unsheltered. Safe haven has no family rows — `sh_individual = sh_total` (family contribution is implicitly zero).
+
+`family_households` rows (count_unit='household') are separated into the `shelter+family_unit` dimension set because they count household units, not persons, and cannot be summed with person-count rows.
+
+---
+
+### 1.3 Veteran Status
+
+**Column name:** `veteran`
+**Data type:** `boolean`, nullable
+**Null meaning:** count is not filtered to veterans
+
+| Source phrase | Value |
+|---|---|
+| `Homeless Veterans` | `true` |
+| All other rows | `null` |
+
+Veterans are a cross-cutting subset of the total population — they are not a partition of individual/family and cannot be summed with other cross-cuts without double-counting.
+
+---
+
+### 1.4 Unaccompanied Youth
+
+**Column name:** `unaccompanied_youth`
+**Data type:** `boolean`, nullable
+**Null meaning:** count is not filtered to unaccompanied youth
+
+| Source phrase | `unaccompanied_youth` | `age_upper` |
 |---|---|---|
-| `Homeless Individuals` | `individual` | People living outside family households |
-| `Homeless People in Families` | `family` | People living within family household groups |
-| `Homeless Family Households` | `family_households` | **Count of household units**, not people |
-| `Homeless Veterans` | `veteran` | Cross-cutting subset; not a partition of the population |
-| `Homeless Unaccompanied Youth (Under 25)` | `unaccompanied_youth` | Youth aged <25 without guardian |
-| `Homeless Unaccompanied Youth Under 18` | `unaccompanied_youth_under18` | Age sub-group of unaccompanied youth |
-| `Homeless Unaccompanied Youth Age 18-24` | `unaccompanied_youth_18_24` | Age sub-group of unaccompanied youth |
-| `Homeless Parenting Youth (Under 25)` | `parenting_youth` | Youth parents aged <25 |
-| `Homeless Parenting Youth Under 18` | `parenting_youth_under18` | Age sub-group of parenting youth |
-| `Homeless Parenting Youth Age 18-24` | `parenting_youth_18_24` | Age sub-group of parenting youth |
-| `Homeless Children of Parenting Youth` | `children_of_parenting_youth` | Children in parenting youth households |
-| `Chronically Homeless` | `chronically_homeless` | Long-term homeless cross-cut |
-| `Chronically Homeless Individuals` | `chronically_homeless_individuals` | Chronically homeless individuals |
-| `Chronically Homeless People in Families` | `chronically_homeless_family` | Chronically homeless family members |
+| `Homeless Unaccompanied Youth (Under 25)` | `true` | `null` — **excluded as redundant (R6)** |
+| `Homeless Unaccompanied Youth Under 18` | `true` | `17` |
+| `Homeless Unaccompanied Youth Age 18-24` | `true` | `24` |
 
-**Notes on household semantics:**
-- `individual` and `family` form an exhaustive partition of the total count for any given shelter type. Confirmed: `es_individual + es_family = es_total`, `th_individual + th_family = th_total`, `unsheltered_individual + unsheltered_family = unsheltered_total` (all spot-checked 2021–2024). For `sh`: no `family` rows exist, and `sh_individual = sh_total`.
-- All other household values (`veteran`, `unaccompanied_youth`, `parenting_youth`, etc.) are **cross-cutting subsets**, not a partition. They cannot be summed to recover the total.
-- `family_households` counts **household units**, not persons. It is not additive with person-count columns.
+The Under-25 aggregate is excluded because `under_18 + 18–24 = Under-25 total` (confirmed 2021–2024 across ES, TH, SH, unsheltered). Only the age-disaggregated rows are retained. The `age_upper` column is reused; the associated age ranges are a subset of the general age dimension (only 17 and 24 appear here, not the full adult range).
 
 ---
 
-### 1.3 Age Range
+### 1.5 Parenting Youth
 
-**Narrow column name:** `age_upper`
-**Data type:** `int`, nullable
-**Null meaning:** column is not filtered by age range
+**Column name:** `parenting_youth`
+**Data type:** `boolean`, nullable
+**Null meaning:** count is not filtered to parenting youth
 
-Source string → integer upper bound:
+**Definition (HUD CPD-23-11, August 2023, p. 44):**
+> "Parenting Youth – A youth who identifies as the parent or legal guardian of one or more children who are present with or sleeping in the same place as that youth parent, where there is no person age 25 or older in the household."
 
-| Source string | Upper bound integer | Notes |
+This is a *young person (under 25) who is a parent* — not a parent of any age who has a young child. The age sub-breakdowns (`Under 18` and `Age 18-24`) refer to the age of the parenting youth themselves, not their children. Source: https://www.hud.gov/sites/dfiles/OCHCO/documents/2023-11cpdn.pdf
+
+| Source phrase | `parenting_youth` | `age_upper` |
 |---|---|---|
-| `Under 18` | `17` | Ages 0–17 |
-| `Age 18 to 24` | `24` | Ages 18–24 |
-| `Age 25 to 34` | `34` | Ages 25–34 |
-| `Age 35 to 44` | `44` | Ages 35–44 |
-| `Age 45 to 54` | `54` | Ages 45–54 |
-| `Age 55 to 64` | `64` | Ages 55–64 |
-| `Over 64` | `110` | Ages 65+ (open-ended, capped at 110) |
-| `Over 24` | `110` | Ages 25+ (open-ended) — **see anomaly §5.1** |
+| `Homeless Parenting Youth (Under 25)` | `true` | `null` — **excluded as redundant (R6)** |
+| `Homeless Parenting Youth Under 18` | `true` | `17` |
+| `Homeless Parenting Youth Age 18-24` | `true` | `24` |
 
-**Age data availability by year:**
-
-- 2007–2012: No age breakdown data (all age columns null).
-- 2013–2022: Only `Under 18`, `Age 18 to 24`, and `Over 24` are populated. The `Over 24` column is the sole representation of all ages above 24.
-- 2023: Only granular ages populated (`Age 25 to 34` through `Over 64`); `Over 24` is null.
-- 2024: Both `Over 24` and all granular ages are populated; `Over 24` = sum of `Age 25 to 34` through `Over 64` (confirmed).
-
-Age breakdowns exist only for `individual` and `family` household types.
+Same redundancy logic as unaccompanied youth: the Under-25 aggregate equals the sum of the two age sub-groups (confirmed 2021–2024). Note: SH has no parenting youth rows at all (source data does not report them for safe haven).
 
 ---
 
-### 1.4 Gender
+### 1.6 Children of Parenting Youth
 
-**Narrow column name:** `gender`
+**Column name:** `children_of_parenting_youth`
+**Data type:** `boolean`, nullable
+**Null meaning:** count is not filtered to children of parenting youth
+
+| Source phrase | Value |
+|---|---|
+| `Homeless Children of Parenting Youth` | `true` |
+| All other rows | `null` |
+
+These rows count the children (typically under 18) living with their homeless youth parents. They appear only at the `shelter+children_of_parenting_youth` level with no further sub-dimensions (no age, gender, or race breakdown in source data).
+
+**Clarification on `accompanied_youth`:** This column is proposed instead of the suggested `accompanied_youth` flag. The label "accompanied youth" does not correspond to any source column. In HUD PIT data, "accompanied" youth typically refers to youth who are with a parent/guardian — the inverse of "unaccompanied youth" — but this population is not separately reported in the source. The children in parenting-youth households (`children_of_parenting_youth`) are a distinct concept and are named accordingly.
+
+---
+
+### 1.7 Chronic Homelessness
+
+**Column name:** `chronic`
+**Data type:** `boolean`, nullable
+**Null meaning:** count is not filtered to chronically homeless individuals
+
+| Source phrase | `chronic` | `in_family` |
+|---|---|---|
+| `Chronically Homeless` (no individual/family split) | `true` | `null` — **excluded as redundant (R7)** |
+| `Chronically Homeless Individuals` | `true` | `false` |
+| `Chronically Homeless People in Families` | `true` | `true` |
+
+`Chronically Homeless` (the aggregate) is confirmed redundant: `chronically_homeless_individuals + chronically_homeless_family = chronically_homeless` (ES spot-checks: 2021: 845+91=936; 2022: 884+95=979; 2023: 968+89=1057; 2024: 1180+203=1383). For SH, which has no family component, `chronically_homeless_individuals = chronically_homeless` (2021–2024: 14, 12, 11, 8).
+
+**Derived complement (`chronic = false`):** Because `chronic` individuals are a strict subset of the total individual (and family) count, `chronic = false` rows can be safely derived:
+- `non_chronic_individual = total_individual − chronic_individual` (for each shelter type where both exist)
+- `non_chronic_family = total_family − chronic_family` (ES and unsheltered only; SH has no family)
+
+Spot-checked for positivity across all available years (2019–2024):
+- ES: non_chronic_ind ranges from 298 to 842; non_chronic_fam ranges from 190 to 254. All positive. ✓
+- SH: non_chronic_ind ranges from 3 to 12. All positive. ✓
+- Unsheltered: non_chronic_ind ranges from 3,796 to 5,108; non_chronic_fam ranges from 24 to 290. All positive. ✓
+
+These derived rows are stored with `is_derived = true` and `source_column` set to a synthetic description (e.g., `'<derived> Sheltered ES Non-Chronically Homeless Individuals'`). They belong to the `shelter+chronic+in_family` dimension set alongside the `chronic=true` source rows. See §10 for the derivation procedure.
+
+Chronic breakdowns exist only for `es`, `sh`, and `unsheltered`. `Sheltered TH Chronically Homeless` does not exist in the source (TH does not typically serve chronically homeless under HUD definitions), so no TH complement is possible.
+
+---
+
+### 1.8 Count Unit
+
+**Column name:** `count_unit`
+**Data type:** `text`, NOT NULL, DEFAULT `'person'`
+**Values:** `'person'` or `'household'`
+
+All rows count persons except rows derived from `Homeless Family Households` source columns, which count household units (family groups), not individuals. Example: `Overall Homeless Family Households = 237` while `Overall Homeless People in Families = 699` (2024) — these measure different things and cannot be summed.
+
+`count_unit = 'household'` rows have `in_family = true` and belong to the dedicated `shelter+family_unit` dimension set (3 source columns: ES, TH, unsheltered — SH has no family rows). They are kept separate from `shelter+in_family`, which contains only person-count rows, so that `SUM(count) WHERE dimension_set = 'shelter+in_family'` is always a homogeneous person total.
+
+---
+
+### 1.9 Age Range
+
+**Column name:** `age_upper`
+**Data type:** `smallint`, nullable
+**Null meaning:** count is not disaggregated by age
+
+| Source string | Upper bound | Lower bound (implicit) | Notes |
+|---|---|---|---|
+| `Under 18` | `17` | 0 | |
+| `Age 18 to 24` | `24` | 18 | |
+| `Age 25 to 34` | `34` | 25 | 2023–2024 only |
+| `Age 35 to 44` | `44` | 35 | 2023–2024 only |
+| `Age 45 to 54` | `54` | 45 | 2023–2024 only |
+| `Age 55 to 64` | `64` | 55 | 2023–2024 only |
+| `Over 64` | `110` | 65 | 2023–2024 only |
+| `Over 24` | `110` | 25 | 2013–2022 retained; 2024 excluded as redundant |
+
+**Year coverage:**
+- 2007–2012: No age data (all age columns null in source).
+- 2013–2022: Only `Under 18` (17), `Age 18 to 24` (24), and `Over 24` (110) populated. `Over 24` is the sole 25+ representation for these years and is retained.
+- 2023: Only granular ages (34–110) populated; `Over 24` is null.
+- 2024: Granular ages populated; `Over 24` is also populated but is confirmed equal to their sum and is therefore excluded.
+
+**Consequence:** In years 2013–2022, `age_upper = 110` means "ages 25 and older (no finer breakdown available)." In 2023+, `age_upper = 110` means "ages 65 and older." These are different intervals. The `source_column` field distinguishes them; alternatively a query can filter `year <= 2022` vs `year >= 2023` when `age_upper = 110`.
+
+Age breakdowns exist for `in_family` rows (individual and family household types) and for `unaccompanied_youth` / `parenting_youth` rows (only age_upper = 17 or 24 for the youth categories).
+
+---
+
+### 1.10 Gender
+
+**Column name:** `gender`
 **Data type:** `text` (enum), nullable
-**Null meaning:** column is not filtered by gender
-
-Source string → normalized enum value:
+**Null meaning:** count is not disaggregated by gender
 
 | Source string | Normalized value |
 |---|---|
@@ -112,120 +255,102 @@ Source string → normalized enum value:
 | `Culturally Specific Identity` | `culturally_specific_identity` |
 | `Different Identity` | `different_identity` |
 
-Gender values are an **exhaustive partition** of the total. Confirmed for 2024: sum of all 8 gender values = `Overall Homeless` total.
+Gender values are an exhaustive partition of the total. Confirmed for 2024: sum of all 8 gender values = total for the corresponding shelter/household combination.
 
-Gender breakdowns exist for household types: `individual`, `family`, `veteran`, `unaccompanied_youth`, `parenting_youth`.
+Gender breakdowns exist for `in_family` rows (individual and family), and for `veteran`, `unaccompanied_youth`, and `parenting_youth` cross-cuts.
 
 ---
 
-### 1.5 Race / Ethnicity
+### 1.11 Race and Hispanic Ethnicity
 
-The source data uses a two-axis model:
-- **Race (any):** counts all people who selected that race, regardless of other selections (includes multi-racial).
-- **Race (only):** counts people who selected only that single race.
-- **Race + Hispanic:** counts people who selected that race AND identified as Hispanic/Latina/e/o.
+**Two separate columns.** The source data uses a two-axis model that maps cleanly to independent `race` and `hispanic` columns.
 
-These three columns are related by the identity: **race(any) = race_only + race_and_hispanic** (confirmed 2024 for Black: 3,912 = 3,825 + 87).
+---
 
-Additionally:
-- **Hispanic** total = sum of all `race_and_hispanic` combinations + `Hispanic/Latina/e/o Only` (confirmed 2024: 2,129 = 138+10+87+3+19+354+58+1,460).
-- **Non-Hispanic** total = sum of all `race_only` values (confirmed 2024: 7,321 = 120+443+3,825+43+110+2,456+324).
-- `race_only + race_and_hispanic` across all categories sums to `Overall Homeless` total (confirmed 2024: 9,450).
+**Column name:** `race`
+**Data type:** `text` (enum), nullable
+**Null meaning:** count is not disaggregated by race (includes Hispanic-only rows where no racial group is specified)
 
-**Race dimension (`race_only` sub-type):**
-
-**Narrow column name:** `race`
-**Data type:** `text`, nullable
-**Null meaning:** column is not filtered by race/ethnicity
-
-Source string (appears as `"<Race> Only"` in column name) → canonical enum:
-
-| Source string (base) | Canonical enum |
+| Source string (from `... Only` or `... and Hispanic/Latina/e/o` columns) | Canonical enum |
 |---|---|
-| `American Indian, Alaska Native, or Indigenous Only` | `american_indian_alaska_native_indigenous` |
-| `Asian or Asian American Only` | `asian` |
-| `Black, African American, or African Only` | `black` |
-| `Middle Eastern or North African Only` | `middle_eastern_north_african` |
-| `Native Hawaiian or Other Pacific Islander Only` | `native_hawaiian_pacific_islander` |
-| `White Only` | `white` |
-| `Multi-Racial Only` | `multi_racial` |
-| `Hispanic/Latina/e/o Only` | `hispanic` |
+| `American Indian, Alaska Native, or Indigenous` | `american_indian_alaska_native_indigenous` |
+| `Asian or Asian American` | `asian` |
+| `Black, African American, or African` | `black` |
+| `Middle Eastern or North African` | `middle_eastern_north_african` |
+| `Native Hawaiian or Other Pacific Islander` | `native_hawaiian_pacific_islander` |
+| `White` | `white` |
+| `Multi-Racial` | `multi_racial` |
+| `Hispanic/Latina/e/o Only` (no race specified) | `null` |
 
-**Race + Ethnicity dimension (`race_and_hispanic` sub-type):**
+`hispanic` is removed from the race enum. It is now a separate boolean column.
 
-Source string → normalized comma-separated value (alphabetically ordered):
+---
 
-| Source string | Normalized value |
-|---|---|
-| `American Indian, Alaska Native, or Indigenous and Hispanic/Latina/e/o` | `american_indian_alaska_native_indigenous,hispanic` |
-| `Asian or Asian American and Hispanic/Latina/e/o` | `asian,hispanic` |
-| `Black, African American, or African and Hispanic/Latina/e/o` | `black,hispanic` |
-| `Middle Eastern or North African and Hispanic/Latina/e/o` | `hispanic,middle_eastern_north_african` |
-| `Native Hawaiian or Other Pacific Islander and Hispanic/Latina/e/o` | `hispanic,native_hawaiian_pacific_islander` |
-| `White and Hispanic/Latina/e/o` | `hispanic,white` |
-| `Multi-Racial and Hispanic/Latina/e/o` | `hispanic,multi_racial` |
+**Column name:** `hispanic`
+**Data type:** `boolean`, nullable
+**Null meaning:** count is not disaggregated by Hispanic/Latino ethnicity
+
+| Source column suffix | `race` | `hispanic` |
+|---|---|---|
+| `<Race> Only` | `<canonical race>` | `false` |
+| `<Race> and Hispanic/Latina/e/o` | `<canonical race>` | `true` |
+| `Hispanic/Latina/e/o Only` | `null` | `true` |
+
+**Verification:** This two-column model fully covers the source data without loss:
+- `race(any) = race_only + race_and_hispanic` was the identity used to exclude race(any) columns. In the new model, this is `(race=X, hispanic=false) + (race=X, hispanic=true) = race(any) for X`. The exclusion rule R2 still applies.
+- `Non-Hispanic` total = sum of all `(hispanic=false)` rows (confirmed 2024: 7,321).
+- `Hispanic` total = sum of all `(hispanic=true)` rows across all race values including null (confirmed 2024: 2,129).
+
+Race/hispanic breakdowns exist for `in_family` rows, and for `veteran`, `unaccompanied_youth`, and `parenting_youth` cross-cuts.
 
 ---
 
 ## 2. Race Enum List
 
-Canonical lowercase enum values for the `race` column (single-race identifiers):
+Canonical lowercase enum values for the `race` column:
 
 ```
 american_indian_alaska_native_indigenous
 asian
 black
-hispanic
 middle_eastern_north_african
 multi_racial
 native_hawaiian_pacific_islander
 white
 ```
 
-When a person identifies as both a racial group and Hispanic/Latino, the `race` column value for that row is a **comma-separated, alphabetically ordered** combination:
+`hispanic` is NOT in this enum. It is captured separately in the `hispanic` boolean column.
 
-```
-american_indian_alaska_native_indigenous,hispanic
-asian,hispanic
-black,hispanic
-hispanic,middle_eastern_north_african
-hispanic,multi_racial
-hispanic,native_hawaiian_pacific_islander
-hispanic,white
-```
-
-**SQL storage options for `race`:**
-- **`text` (comma-separated):** Simple to store; queryable with `WHERE race = 'black,hispanic'` for exact match or `WHERE race LIKE '%black%'` / `position('black' in race) > 0` for inclusive. Tradeoff: loose string matching risks false positives on names that share substrings (unlikely with these values but possible).
-- **`text[]` (PostgreSQL array):** Enables clean `WHERE 'black' = ANY(race)` queries and `@>` containment operators. Requires array-aware application code. Tradeoff: less portable across databases; requires unnesting for certain aggregations.
-
-Recommendation: Use `text` for simplicity given the small, non-overlapping enum vocabulary; document that queries must use exact enum strings.
+**SQL storage:** `text` enum is recommended given the small, non-overlapping vocabulary. If using a PostgreSQL enum type, declare it separately. Alternatively use `text` with a CHECK constraint.
 
 ---
 
 ## 3. Age Range Mapping
 
-| Source string | Normalized upper bound | Years active |
-|---|---|---|
-| `Under 18` | `17` | 2013–2024 (null 2007–2012) |
-| `Age 18 to 24` | `24` | 2013–2024 (null 2007–2012) |
-| `Over 24` | `110` (open-ended) | 2013–2022, 2024; null in 2023 — **see anomaly §5.1** |
-| `Age 25 to 34` | `34` | 2023–2024 only |
-| `Age 35 to 44` | `44` | 2023–2024 only |
-| `Age 45 to 54` | `54` | 2023–2024 only |
-| `Age 55 to 64` | `64` | 2023–2024 only |
-| `Over 64` | `110` (open-ended) | 2023–2024 only |
+| Source string | Normalized upper bound | Lower bound | Retained years |
+|---|---|---|---|
+| `Under 18` | `17` | 0 | 2013–2024 (null 2007–2012) |
+| `Age 18 to 24` | `24` | 18 | 2013–2024 (null 2007–2012) |
+| `Over 24` | `110` | 25 | 2013–2022 retained; **excluded 2024** |
+| `Age 25 to 34` | `34` | 25 | 2023–2024 only |
+| `Age 35 to 44` | `44` | 35 | 2023–2024 only |
+| `Age 45 to 54` | `54` | 45 | 2023–2024 only |
+| `Age 55 to 64` | `64` | 55 | 2023–2024 only |
+| `Over 64` | `110` | 65 | 2023–2024 only |
 
-**Note:** Both `Over 24` and `Over 64` map to upper bound `110`. A query filtering `WHERE age_upper = 110` will return rows from both source ranges. Consumers must also filter `WHERE source_column LIKE '%Over 64%'` or use `dimension_set` to distinguish them.
+For youth categories (`unaccompanied_youth`, `parenting_youth`), only `Under 18` → 17 and `Age 18-24` → 24 appear.
 
 ---
 
 ## 4. Dimension Set Catalog
 
-A **dimension set** identifies the specific combination of dimensions encoded in a source column. The `dimension_set` tag must be used to prevent double-counting in queries: always filter to a single dimension set before summing.
+A **dimension set** identifies the specific combination of non-null dimensions encoded in a source column. Always filter to a single dimension set before aggregating to avoid double-counting.
 
 ### 4.1 All dimension sets in source data (pre-exclusion)
 
-| Dimension set tag | Example source column | Column count |
+These are the 14 dimension sets identified from the 1,304 count columns, using the original monolithic household model for reference:
+
+| Dimension set tag (original) | Example source column | Column count |
 |---|---|---|
 | `shelter` | `Overall Homeless` | 6 |
 | `shelter+age` | `Overall Homeless - Under 18` | 48 |
@@ -242,73 +367,75 @@ A **dimension set** identifies the specific combination of dimensions encoded in
 | `shelter+household+race_only` | `Overall Homeless Individuals - Black, African American, or African Only` | 224 |
 | `shelter+household+race_and_hispanic` | `Overall Homeless Individuals - Black, African American, or African and Hispanic/Latina/e/o` | 196 |
 
-**Total:** 1,304 count columns across 14 dimension sets.
+**Total: 1,304 count columns.**
 
-### 4.2 Retained dimension sets (post-exclusion)
+### 4.2 Retained dimension sets (new atomic model, post-exclusion)
 
-After applying the exclusion rule (Section 9), the following dimension sets are retained in the fact table:
+After applying all exclusion rules (§9) and adopting the unbundled dimension model, **506 source columns** are retained across **16 dimension sets**:
 
-| Dimension set tag | Example source column | Retained column count | Shelter values | Household values |
-|---|---|---|---|---|
-| `shelter+household` | `Sheltered ES Homeless Individuals` | 46 | es, th, sh, unsheltered | individual, family, family_households, veteran, unaccompanied_youth, unaccompanied_youth_under18, unaccompanied_youth_18_24, parenting_youth, parenting_youth_under18, parenting_youth_18_24, children_of_parenting_youth, chronically_homeless, chronically_homeless_individuals, chronically_homeless_family |
-| `shelter+household+age` | `Sheltered ES Homeless Individuals - Under 18` | 56 | es, th, sh, unsheltered | individual, family |
-| `shelter+household+gender` | `Sheltered ES Homeless Individuals - Woman` | 144 | es, th, sh, unsheltered | individual, family, veteran, unaccompanied_youth, parenting_youth |
-| `shelter+household+race_only` | `Sheltered ES Homeless Individuals - Black, African American, or African Only` | 144 | es, th, sh, unsheltered | individual, family, veteran, unaccompanied_youth, parenting_youth |
-| `shelter+household+race_and_hispanic` | `Sheltered ES Homeless Individuals - Black, African American, or African and Hispanic/Latina/e/o` | 126 | es, th, sh, unsheltered | individual, family, veteran, unaccompanied_youth, parenting_youth |
+| Dimension set tag | Example source column | Source cols | Notes |
+|---|---|---|---|
+| `shelter+in_family` | `Sheltered ES Homeless Individuals` | 7 | Person counts only (4 individual + 3 family); see below |
+| `shelter+family_unit` | `Sheltered ES Homeless Family Households` | 3 | Household unit counts; ES, TH, unsheltered only (no SH family) |
+| `shelter+in_family+age` | `Sheltered ES Homeless Individuals - Under 18` | 56 | |
+| `shelter+in_family+gender` | `Sheltered ES Homeless Individuals - Woman` | 56 | |
+| `shelter+in_family+race+hispanic` | `Sheltered ES Homeless Individuals - Black, African American, or African Only` | 105 | |
+| `shelter+veteran` | `Sheltered ES Homeless Veterans` | 4 | |
+| `shelter+veteran+gender` | `Sheltered ES Homeless Veterans - Woman` | 32 | |
+| `shelter+veteran+race+hispanic` | `Sheltered ES Homeless Veterans - Black, African American, or African Only` | 60 | |
+| `shelter+unaccompanied_youth+age` | `Sheltered ES Homeless Unaccompanied Youth Under 18` | 8 | |
+| `shelter+unaccompanied_youth+gender` | `Sheltered ES Homeless Unaccompanied Youth (Under 25) - Woman` | 32 | |
+| `shelter+unaccompanied_youth+race+hispanic` | `Sheltered ES Homeless Unaccompanied Youth (Under 25) - Black, African American, or African Only` | 60 | |
+| `shelter+parenting_youth+age` | `Sheltered ES Homeless Parenting Youth Under 18` | 6 | ES, TH, unsheltered only (no SH) |
+| `shelter+parenting_youth+gender` | `Sheltered ES Homeless Parenting Youth (Under 25) - Woman` | 24 | |
+| `shelter+parenting_youth+race+hispanic` | `Sheltered ES Homeless Parenting Youth (Under 25) - Black, African American, or African Only` | 45 | |
+| `shelter+children_of_parenting_youth` | `Sheltered ES Homeless Children of Parenting Youth` | 3 | ES, TH, unsheltered only (no SH) |
+| `shelter+chronic+in_family` | `Sheltered ES Chronically Homeless Individuals` | 5 | ES, SH, unsheltered only; +5 derived rows (§10) |
 
-**Total retained columns:** 516
+**Total retained source columns: 506.** The fact table will contain additional derived rows (see §10): 5 `chronic=false` rows per year derived from the `shelter+chronic+in_family` set.
+
+**Notes on dimension set structure:**
+- `shelter+in_family` is **7 columns** (person counts only): 4 individual (all shelter types) + 3 family person (ES, TH, unsheltered — SH has no family). `SUM(count) WHERE dimension_set = 'shelter+in_family'` is always a homogeneous person total.
+- `shelter+family_unit` is the dedicated set for the 3 `Family Households` source columns (count_unit='household'). Never mix with `shelter+in_family` in aggregations.
+- `shelter+in_family+race+hispanic` merges what were previously two dimension sets (`race_only` and `race_and_hispanic`). The `hispanic` boolean cleanly distinguishes them.
+- `shelter+unaccompanied_youth+gender` and `shelter+parenting_youth+gender` retain the Under-25 aggregate population for gender/race breakdowns — those aggregate rows are not redundant (no finer gender/race breakdown exists within youth). Only the bare totals with no sub-dimension (R6) are excluded.
+- `shelter+chronic+in_family` has 5 source columns (not 8) because TH has no chronically homeless data and SH has no family chronic component. Five derived `chronic=false` rows are added per year via §10.
 
 ---
 
 ## 5. Anomalies and Ambiguities
 
-### 5.1 `Over 24` age range — temporally shifting definition
+### 5.1 `Over 24` age range — resolved
 
-`Over 24` appears in source columns from 2013 to 2022 (and 2024) as the **only** representation of everyone aged 25 and older. In those years, no finer age breakdown above 24 exists in the data. Starting in 2023, granular age buckets (`Age 25 to 34` through `Over 64`) were reported instead.
-
-In 2024, **both** `Over 24` and the granular ages are populated simultaneously. Spot-check confirmed that 2024 `Over 24` = sum of `Age 25 to 34` + `Age 35 to 44` + `Age 45 to 54` + `Age 55 to 64` + `Over 64` (8,596 = 1,696 + 2,439 + 2,069 + 1,733 + 659).
-
-**Impact:** `Over 24` rows cannot be joined or compared with `Age 25 to 34` / `Over 64` rows without disambiguation. If both are loaded into the fact table, a naive `WHERE age_upper = 110` would return double-counted records in 2024. Two options:
-
-- **Option A (recommended):** Treat `Over 24` as a redundant aggregate in all years where the granular ages also exist (2024 onward), and retain it only for years where no finer breakdown is available (2013–2022 and any future year that reverts to the coarser format). Flag rows with a `source_column` that includes `Over 24` so consumers can filter.
-- **Option B:** Load both and require consumers to always filter by `source_column` or a derived `age_format` column.
-
-This requires **human review before loading.**
+`Over 24` coexists with granular adult ages in 2024 only, where it is confirmed redundant (sum of Age 25–34 through Over 64). It is the sole 25+ representation for 2013–2022 and is retained for those years. Rows with `age_upper = 110` and `year <= 2022` represent "ages 25+" while the same value in `year >= 2023` represents "ages 65+". The `source_column` field makes this unambiguous. Consumers grouping across years at `age_upper = 110` should be aware of the different intervals.
 
 ### 5.2 `Sheltered SH Homeless People in Families` — column absent
 
-Safe haven (`sh`) has no "People in Families" household type. All SH counts are individuals-only. The column `Sheltered SH Homeless People in Families` does not exist in the source. As a result, `Sheltered SH Homeless` = `Sheltered SH Homeless Individuals` (verified: both equal 11 in 2024). The redundancy rule treats `sh+no_hh+no_sub` as derivable from `sh+individual` (the family component is implicitly zero).
+Safe haven has no family rows. `Sheltered SH Homeless` = `Sheltered SH Homeless Individuals` (verified 2021–2024). SH also has no `parenting_youth` rows. The family contribution to SH is implicitly zero for all dimension sets.
 
 ### 5.3 `Family Households` — different unit from all other counts
 
-Columns with `Homeless Family Households` count **households** (family units), not persons. Examples:
+`Homeless Family Households` counts household units, not persons (`in_family = true, count_unit = 'household'`). These 3 source columns (ES, TH, unsheltered) are placed in the dedicated `shelter+family_unit` dimension set to prevent accidental mixing with person-count rows in `shelter+in_family`.
 
-- `Overall Homeless Family Households` = 237 (2024)
-- `Overall Homeless People in Families` = 699 (2024)
+### 5.4 `Chronically Homeless` coverage is sparse
 
-These measure different things and cannot be added to person-count columns. In the narrow table, `household = 'family_households'` rows should be clearly documented as counting units rather than persons. Consider adding a `unit` column (`person` vs `household`) or a boolean `is_household_count` column to the schema.
+Chronic columns exist only for ES, SH, and unsheltered (not TH). No gender, race, or age sub-dimensions exist for any chronically homeless population. Consumers should document this limitation.
 
-### 5.4 `Chronically Homeless` — sparse sub-dimension coverage
+### 5.5 `Chronically Homeless` aggregate vs. individual/family split — resolved
 
-Chronically homeless columns (`chronically_homeless`, `chronically_homeless_individuals`, `chronically_homeless_family`) have **no** gender, race, age, or ethnicity sub-dimensions. They appear only at the `shelter+household` level. This is expected (the source data does not report sub-dimensions for this population), but consumers should be aware that no demographic breakdown is available for the chronically homeless population.
+`Chronically Homeless` (no split) is confirmed redundant where `Chronically Homeless Individuals` and `Chronically Homeless People in Families` both exist (ES 2021–2024: all confirmed). Excluded as R7. For SH, `Chronically Homeless Individuals = Chronically Homeless` (no family) — also excluded.
 
-Additionally, `chronically_homeless` and `chronically_homeless_individuals` coexist for some shelter types (e.g., `Sheltered SH Chronically Homeless` = 8 and `Sheltered SH Chronically Homeless Individuals` = 8 in 2024). For SH, these are the same because SH has no families. For ES, they differ:
+### 5.6 `Sheltered TH` has no Chronically Homeless
 
-- Spot check recommended before using these columns to confirm that `chronically_homeless` = `chronically_homeless_individuals` + `chronically_homeless_family` where both exist.
+TH does not have any `Chronically Homeless` columns in the source data. This is expected under HUD definitions (TH is not typically used for chronically homeless individuals). Not a data error.
 
-### 5.5 `Unsheltered Homeless People in Families` — unexpected TH absence
+### 5.7 `Unaccompanied Youth` and `Parenting Youth` gender/race vs. age granularity mismatch
 
-Transitional housing (`th`) has a `People in Families` household type (and `Individuals`), but the Sheltered TH dimension set does **not** include `Chronically Homeless` household types. `Sheltered TH Chronically Homeless` does not appear as a column. This differs from ES and SH which both have chronically homeless columns. This is likely intentional (TH typically does not serve chronically homeless under HUD definitions), but is worth noting for consumers expecting symmetric coverage.
+Gender and race breakdowns for youth use the Under-25 aggregate population (e.g., `Homeless Unaccompanied Youth (Under 25) - Woman`). Age breakdowns for youth use the Under-18 and 18–24 sub-groups. There are no rows that combine both age and gender (or race) for youth. This is a source data limitation — it cannot be resolved in the narrow table. Dimension sets `shelter+unaccompanied_youth+age` and `shelter+unaccompanied_youth+gender` are independent slices that cannot be combined.
 
-### 5.6 `unaccompanied_youth_under18` and `unaccompanied_youth_18_24` — age sub-groups of a cross-cutting subset
+### 5.8 Early years (2007–2012) — sparse data
 
-These are age breakdowns of `unaccompanied_youth (under 25)`. Confirmed: `unaccompanied_youth_under18 + unaccompanied_youth_18_24 = unaccompanied_youth (total)` (verified 2024: 26 + 371 = 397). The same applies for parenting youth.
-
-These sub-groups appear **only** as `shelter+household` (no further gender/race sub-dimensions), unlike the parent `unaccompanied_youth` which does have gender and race sub-dimensions.
-
-### 5.7 Early years (2007–2012) — sparse data
-
-For years 2007–2012, the CSV contains data only for the top-level counts (e.g., `Overall Homeless`, `Sheltered ES Homeless Individuals`, `Sheltered TH Homeless`). Age, gender, race, and household sub-dimensions are largely null for these years. In 2007 and 2008, several columns have **identical values** (possibly a data entry artifact — `Overall Homeless` = 4,838 in both years, `Sheltered ES Homeless` = 992 in both). This should be flagged to the data owner.
+For 2007–2012, only top-level totals are populated. Age, gender, race, and household sub-dimensions are largely null. Additionally, 2007 and 2008 have identical values across many columns (e.g., `Overall Homeless = 4,838` in both years). This may be a data entry artifact and should be flagged to the data owner.
 
 ---
 
@@ -316,303 +443,455 @@ For years 2007–2012, the CSV contains data only for the top-level counts (e.g.
 
 ```sql
 CREATE TABLE pit_counts (
-    id                serial PRIMARY KEY,
+    id                    serial PRIMARY KEY,
 
     -- Metadata
-    year              int  NOT NULL,
-    coc_id            text NOT NULL,   -- e.g. 'CA-502'
+    year                  smallint NOT NULL,
+    coc_id                text     NOT NULL,  -- e.g. 'CA-502'
 
-    -- Dimensions (null = "not disaggregated in source data", NOT "unknown")
-    shelter           text NOT NULL,
+    -- Shelter (always present)
+    shelter               text     NOT NULL,
         -- Values: 'es', 'th', 'sh', 'unsheltered'
-        -- 'overall' and 'sheltered_total' are excluded as redundant aggregates
 
-    household         text,
-        -- Values: 'individual', 'family', 'family_households', 'veteran',
-        --         'unaccompanied_youth', 'unaccompanied_youth_under18', 'unaccompanied_youth_18_24',
-        --         'parenting_youth', 'parenting_youth_under18', 'parenting_youth_18_24',
-        --         'children_of_parenting_youth', 'chronically_homeless',
-        --         'chronically_homeless_individuals', 'chronically_homeless_family'
-        -- null = total population (no household filter)
+    -- In-family status (null = not disaggregated by household type)
+    in_family             boolean,
+        -- true  = person lives within a family household
+        -- false = person lives as an individual (outside family household)
+        -- null  = row is a cross-cutting subset (veteran, youth, etc.)
 
-    age_upper         int,
-        -- Upper bound of age range (17, 24, 34, 44, 54, 64, 110)
-        -- null = not disaggregated by age
-        -- NOTE: both 'Over 24' (110) and 'Over 64' (110) map here; use source_column to distinguish
+    -- Cross-cutting population flags (null = not filtered to this population)
+    veteran               boolean,
+        -- true = counted as homeless veteran; null = not filtered
+    unaccompanied_youth   boolean,
+        -- true = counted as unaccompanied youth (<25); null = not filtered
+    parenting_youth       boolean,
+        -- true = counted as parenting youth (<25); null = not filtered
+    children_of_parenting_youth boolean,
+        -- true = counted as child of homeless parenting youth; null = not filtered
+    chronic               boolean,
+        -- true  = counted as chronically homeless (from source data)
+        -- false = derived complement: non-chronically homeless (see §10)
+        -- null  = not filtered to chronic status
 
-    gender            text,
+    -- Age (null = not disaggregated by age)
+    age_upper             smallint,
+        -- Upper bound of age range: 17, 24, 34, 44, 54, 64, 110
+        -- For in_family rows: full adult range 2023+; only 17/24/110 for 2013–2022
+        -- For unaccompanied_youth/parenting_youth rows: only 17 and 24
+        -- NOTE: age_upper=110 means "25+" for year<=2022, "65+" for year>=2023
+        --       (use source_column to disambiguate if needed)
+
+    -- Gender (null = not disaggregated by gender)
+    gender                text,
         -- Values: 'woman', 'man', 'transgender', 'gender_questioning', 'non_binary',
         --         'more_than_one_gender', 'culturally_specific_identity', 'different_identity'
-        -- null = not disaggregated by gender
 
-    race              text,
-        -- Single race: 'american_indian_alaska_native_indigenous', 'asian', 'black',
-        --              'hispanic', 'middle_eastern_north_african', 'multi_racial',
-        --              'native_hawaiian_pacific_islander', 'white'
-        -- Multi-identity: comma-separated, alphabetically ordered, e.g. 'black,hispanic'
-        -- null = not disaggregated by race
-        --
-        -- This column represents either race_only OR race_and_hispanic depending on dim_set.
-        -- Use dimension_set to distinguish:
-        --   dimension_set = 'shelter+household+race_only'        → single-race-only respondents
-        --   dimension_set = 'shelter+household+race_and_hispanic' → respondents selecting race + Hispanic
+    -- Race (null = not disaggregated by race, OR Hispanic-only respondent with no race specified)
+    race                  text,
+        -- Values: 'american_indian_alaska_native_indigenous', 'asian', 'black',
+        --         'middle_eastern_north_african', 'multi_racial',
+        --         'native_hawaiian_pacific_islander', 'white'
+        -- null when hispanic=true and no racial group selected ('Hispanic/Latina/e/o Only')
 
-        -- ALTERNATIVE: text[] (PostgreSQL array)
-        -- race  text[]
-        -- Enables: WHERE 'black' = ANY(race), WHERE race @> ARRAY['black','hispanic']
-        -- Tradeoff: requires unnesting for count aggregations; less portable
+    -- Hispanic/Latino ethnicity (null = not disaggregated by ethnicity)
+    hispanic              boolean,
+        -- true  = respondent identified as Hispanic/Latina/e/o
+        -- false = respondent did not identify as Hispanic/Latina/e/o (race-only rows)
+        -- null  = row is not disaggregated by ethnicity
 
-    -- Fact
-    count             int  NOT NULL,
+    -- Count
+    count                 int      NOT NULL,
+
+    -- Count unit (all rows are person-counts except family_households source rows)
+    count_unit            text     NOT NULL DEFAULT 'person',
+        -- 'person'    = count represents individuals (all rows except family_household source)
+        -- 'household' = count represents household units (dimension_set='shelter+family_unit' only)
 
     -- Provenance and double-count prevention
-    dimension_set     text NOT NULL,
-        -- Tag identifying the combination of non-null dimensions encoded in this row.
-        -- Always filter to a single dimension_set before aggregating to avoid double-counting.
-        -- Values: 'shelter+household', 'shelter+household+age', 'shelter+household+gender',
-        --         'shelter+household+race_only', 'shelter+household+race_and_hispanic'
+    dimension_set         text     NOT NULL,
+        -- Identifies the combination of non-null dimensions. Always filter to a single
+        -- dimension_set before aggregating to prevent double-counting.
+        -- Values: see §4.2. Key note: 'shelter+in_family' contains person counts only;
+        --         'shelter+family_unit' contains household unit counts — never mix the two.
 
-    source_column     text NOT NULL,
-        -- Exact source column name from the CSV, preserved for provenance.
-        -- Example: 'Sheltered ES Homeless Individuals - Black, African American, or African Only'
+    source_column         text     NOT NULL,
+        -- For source rows: exact column name from the CSV (e.g. 'Sheltered ES Homeless Individuals').
+        -- For derived rows: synthetic description (e.g. '<derived> Sheltered ES Non-Chronically Homeless Individuals').
 
-    -- Optional: distinguish person counts from household-unit counts
-    count_unit        text NOT NULL DEFAULT 'person'
-        -- 'person' for all rows except household='family_households' rows
-        -- 'household' for family_households rows
+    is_derived            boolean  NOT NULL DEFAULT false
+        -- false = row loaded directly from a source CSV column.
+        -- true  = row computed as an implicit complement (§10). Currently only chronic=false rows.
 );
 
 -- Recommended indexes
-CREATE INDEX pit_counts_year_coc ON pit_counts (year, coc_id);
-CREATE INDEX pit_counts_dimension_set ON pit_counts (dimension_set);
-CREATE INDEX pit_counts_shelter_household ON pit_counts (shelter, household);
+CREATE INDEX pit_counts_year_coc         ON pit_counts (year, coc_id);
+CREATE INDEX pit_counts_dimension_set    ON pit_counts (dimension_set);
+CREATE INDEX pit_counts_shelter          ON pit_counts (shelter);
+CREATE INDEX pit_counts_in_family        ON pit_counts (in_family);
+CREATE INDEX pit_counts_race_hispanic    ON pit_counts (race, hispanic);
 ```
 
-**Notes on the race column design:**
-
-Using `text` (comma-separated) is recommended for this dataset given:
-- The enum vocabulary is small (8 values) with no ambiguous substrings.
-- `WHERE race = 'black'` for single-race queries works cleanly.
-- `WHERE race LIKE '%black%'` or `position('black' in race) > 0` for "includes black" queries works without false positives.
-- `WHERE race = 'black,hispanic'` for the exact bi-identity combination works cleanly.
-
-If using `text[]`, replace with:
-```sql
-race  text[]
--- WHERE 'black' = ANY(race)
--- WHERE race @> ARRAY['black', 'hispanic']
--- WHERE array_length(race, 1) = 1  -- single-race only rows
-```
+**Notes:**
+- Only one population flag (`veteran`, `unaccompanied_youth`, `parenting_youth`, `children_of_parenting_youth`, `chronic`) will be non-null per row. They are mutually exclusive in practice (no source column encodes more than one). A CHECK constraint can enforce this if desired.
+- `race` and `hispanic` are always both null or both non-null (they are specified together). The single exception is `Hispanic/Latina/e/o Only` rows where `race IS NULL AND hispanic = true`.
+- Never aggregate across `shelter+in_family` and `shelter+family_unit` — they measure persons and household units respectively. The `count_unit` column and `dimension_set` both signal this, but an explicit check before any `SUM` is good practice.
+- Derived `chronic=false` rows are always paired with a corresponding `chronic=true` source row for the same `(year, coc_id, shelter, in_family)`. Their sum equals the total individual or family count from the `shelter+in_family` dimension set.
 
 ---
 
 ## 7. Redundant Aggregate Column List
 
-**788 columns are excluded** from the narrow fact table because their values are derivable by summing more granular rows. They are grouped below by redundancy reason.
+**798 columns are excluded** (up from 788 in the prior analysis, due to 10 new columns excluded under rules R6 and R7).
 
-### 7.1 shelter = `overall` (231 columns)
+### R1 — shelter = `overall` (231 columns)
 
-All columns with the `Overall ...` prefix are sums of the four atomic shelter types (es, th, sh, unsheltered). Confirmed spot-check (2017–2019, 2024): `Overall Homeless` = `Sheltered ES Homeless` + `Sheltered TH Homeless` + `Sheltered SH Homeless` + `Unsheltered Homeless`.
+All `Overall ...` prefix columns. Derivable as `es + th + sh + unsheltered`.
+Confirmed (2017, 2019, 2024): `Overall Homeless` = sum of four atomic shelter totals.
 
-Examples (representative, not exhaustive):
-- `Overall Homeless`
-- `Overall Homeless - Under 18`
-- `Overall Homeless - Woman`
-- `Overall Homeless - Black, African American, or African Only`
-- `Overall Homeless Individuals`
-- `Overall Homeless Individuals - Woman`
-- `Overall Homeless People in Families - Black, African American, or African Only`
-- `Overall Homeless Veterans - Woman`
-- `Overall Chronically Homeless`
-- ... (231 total)
+### R2 — race(any) sub-dimension (154 columns)
 
-### 7.2 shelter = `sheltered_total` (231 columns)
+Columns where the race suffix has no `Only` and no `and Hispanic` — e.g., `Black, African American, or African` (without qualifier). Derivable as `(race=X, hispanic=false) + (race=X, hispanic=true)`.
+Confirmed 2024 (Black): 3,912 = 3,825 + 87.
 
-All columns with the `Sheltered Total ...` prefix are sums of ES + TH + SH. Confirmed spot-check (2017–2019, 2024): `Sheltered Total Homeless` = `Sheltered ES Homeless` + `Sheltered TH Homeless` + `Sheltered SH Homeless`.
+### R3 — ethnicity sub-dimension (44 columns)
 
-Examples:
-- `Sheltered Total Homeless`
-- `Sheltered Total Homeless - Under 18`
-- `Sheltered Total Homeless Individuals`
-- `Sheltered Total Homeless Veterans - Woman`
-- ... (231 total)
+`Hispanic/Latina/e/o` and `Non-Hispanic/Latina/e/o` columns. Derivable from the `hispanic` boolean decomposition:
+- `Non-Hispanic` = sum of `hispanic=false` rows for the same shelter/household combination (confirmed 2024: 7,321).
+- `Hispanic` = sum of `hispanic=true` rows (confirmed 2024: 2,129).
 
-### 7.3 race(any) columns (154 columns)
+### R4 — atomic shelter, no household filter, with sub-dimension (124 columns)
 
-Columns where the sub-dimension is a race name **without** the `Only` suffix and **without** `and Hispanic/Latina/e/o`. These count all people selecting that race regardless of other identities. The identity `race(any) = race_only + race_and_hispanic` holds precisely (confirmed 2024 for Black: 3,912 = 3,825 + 87). Including both would double-count multi-racial respondents.
+E.g., `Sheltered ES Homeless - Under 18`. Derivable as `(es + individual + sub-dim) + (es + family + sub-dim)`.
+Confirmed (ES Under 18 2024: 247 = 15 + 232; TH Woman 2024: 301 = 174 + 127).
 
-Examples:
-- `Sheltered ES Homeless Individuals - American Indian, Alaska Native, or Indigenous`
-- `Sheltered ES Homeless Individuals - Asian or Asian American`
-- `Sheltered ES Homeless Individuals - Black, African American, or African`
-- `Sheltered ES Homeless Individuals - Middle Eastern or North African`
-- `Sheltered ES Homeless Individuals - Native Hawaiian or Other Pacific Islander`
-- `Sheltered ES Homeless Individuals - White`
-- `Sheltered ES Homeless Individuals - Multi-Racial`
-- ... (154 total, 7 race groups × all shelter/household combinations)
+### R5 — atomic shelter, no household filter, no sub-dimension (4 columns)
 
-### 7.4 Ethnicity columns — Hispanic and Non-Hispanic (44 columns)
+`Sheltered ES Homeless`, `Sheltered TH Homeless`, `Sheltered SH Homeless`, `Unsheltered Homeless`. Derivable as `individual + family`.
+Confirmed all four shelter types 2024.
 
-`Hispanic/Latina/e/o` and `Non-Hispanic/Latina/e/o` sub-dimensions are derivable from the race_only/race_and_hispanic decomposition:
-- `Non-Hispanic` = sum of all `race_only` values (confirmed 2024: 7,321).
-- `Hispanic` = sum of all `race_and_hispanic` values + `Hispanic/Latina/e/o Only` (confirmed 2024: 2,129).
+### R6 — Youth Under-25 aggregates (7 columns) *(new)*
 
-Examples:
-- `Sheltered ES Homeless - Hispanic/Latina/e/o`
-- `Sheltered ES Homeless - Non-Hispanic/Latina/e/o`
-- `Sheltered ES Homeless Individuals - Hispanic/Latina/e/o`
-- `Sheltered ES Homeless Individuals - Non-Hispanic/Latina/e/o`
-- ... (44 total, 2 ethnicity values × all shelter/household combos that have ethnicity data)
+Columns for `Homeless Unaccompanied Youth (Under 25)` and `Homeless Parenting Youth (Under 25)` with **no sub-dimension**. Derivable as `under_18 + 18–24`.
+Confirmed (ES unaccompanied youth 2021: 8+58=66; 2024: 15+71=86; parenting youth 2024: verified).
 
-### 7.5 Atomic shelter, no household filter, with sub-dimension (124 columns)
+Examples excluded:
+- `Sheltered ES Homeless Unaccompanied Youth (Under 25)`
+- `Sheltered TH Homeless Unaccompanied Youth (Under 25)`
+- `Sheltered SH Homeless Unaccompanied Youth (Under 25)` *(if present)*
+- `Unsheltered Homeless Unaccompanied Youth (Under 25)`
+- `Sheltered ES Homeless Parenting Youth (Under 25)`
+- `Sheltered TH Homeless Parenting Youth (Under 25)`
+- `Unsheltered Homeless Parenting Youth (Under 25)`
 
-Columns such as `Sheltered ES Homeless - Under 18` (shelter = es, household = null, age = 17) are derivable as the sum of `Sheltered ES Homeless Individuals - Under 18` + `Sheltered ES Homeless People in Families - Under 18`. Confirmed spot-check 2024: ES Under 18 = 247 = 15 (individual) + 232 (family); TH Woman = 301 = 174 + 127; Unsheltered Woman = 1,719 = 1,678 + 41.
+### R7 — Chronically Homeless aggregate (3 columns) *(new)*
 
-For SH specifically, no "family" household exists, so `Sheltered SH Homeless - Under 18` = `Sheltered SH Homeless Individuals - Under 18` (family contribution = 0).
+`Chronically Homeless` (no individual/family split) for ES, SH, and unsheltered. Derivable as `chronically_homeless_individuals + chronically_homeless_family`.
+Confirmed (ES 2021–2024: four spot-checks, all match). For SH, `chronically_homeless = chronically_homeless_individuals` (no family contribution).
 
-This group covers 31 sub-dimensions × 4 atomic shelter types = 124 columns:
-- 8 age values × 4 shelters = 32 age columns
-- 8 gender values × 4 shelters = 32 gender columns
-- 8 race_only values × 4 shelters = 32 race_only columns
-- 7 race_and_hispanic values × 4 shelters = 28 race_and_hispanic columns
+### R1b — shelter = `sheltered_total` (231 columns)
 
-Examples:
-- `Sheltered ES Homeless - Under 18`
-- `Sheltered ES Homeless - Woman`
-- `Sheltered ES Homeless - Black, African American, or African Only`
-- `Sheltered TH Homeless - Age 18 to 24`
-- `Unsheltered Homeless - White and Hispanic/Latina/e/o`
-- ... (124 total)
-
-### 7.6 Atomic shelter, no household filter, no sub-dimension (4 columns)
-
-The four columns representing total counts per atomic shelter type with no further breakdown are also derivable as `individual + family`:
-
-- `Sheltered ES Homeless` = `Sheltered ES Homeless Individuals` + `Sheltered ES Homeless People in Families` (confirmed 2024: 2,271 = 1,868 + 403)
-- `Sheltered TH Homeless` = `Sheltered TH Homeless Individuals` + `Sheltered TH Homeless People in Families` (confirmed 2024: 825 = 635 + 190)
-- `Sheltered SH Homeless` = `Sheltered SH Homeless Individuals` (confirmed 2024: 11 = 11, no family in SH)
-- `Unsheltered Homeless` = `Unsheltered Homeless Individuals` + `Unsheltered Homeless People in Families` (confirmed 2024: 6,343 = 6,237 + 106)
+All `Sheltered Total ...` prefix columns. Derivable as `es + th + sh`.
+Confirmed (2017, 2019, 2024).
 
 ---
 
 ## 8. Retained Dimension Sets
 
-After excluding all redundant aggregate columns (Section 7), **516 columns** are retained. These form 5 maximally disaggregated dimension sets:
+After all exclusions, **506 source columns** are retained across **16 dimension sets**. The fact table additionally contains derived rows (see §10).
 
-### `shelter+household` — 46 columns
+| Dimension set | Shelter values | Other dimension values | Source cols | Derived rows/yr |
+|---|---|---|---|---|
+| `shelter+in_family` | es, th, sh, unsheltered | in_family: true/false; count_unit: person | 7 | — |
+| `shelter+family_unit` | es, th, unsheltered | in_family: true; count_unit: household | 3 | — |
+| `shelter+in_family+age` | es, th, sh, unsheltered | in_family: true/false; age_upper: 17,24,34,44,54,64,110 | 56 | — |
+| `shelter+in_family+gender` | es, th, sh, unsheltered | in_family: true/false; gender: 8 values | 56 | — |
+| `shelter+in_family+race+hispanic` | es, th, sh, unsheltered | in_family: true/false; race: 7+null; hispanic: true/false | 105 | — |
+| `shelter+veteran` | es, th, sh, unsheltered | veteran: true | 4 | — |
+| `shelter+veteran+gender` | es, th, sh, unsheltered | veteran: true; gender: 8 values | 32 | — |
+| `shelter+veteran+race+hispanic` | es, th, sh, unsheltered | veteran: true; race: 7+null; hispanic: true/false | 60 | — |
+| `shelter+unaccompanied_youth+age` | es, th, sh, unsheltered | unaccompanied_youth: true; age_upper: 17, 24 | 8 | — |
+| `shelter+unaccompanied_youth+gender` | es, th, sh, unsheltered | unaccompanied_youth: true; gender: 8 values | 32 | — |
+| `shelter+unaccompanied_youth+race+hispanic` | es, th, sh, unsheltered | unaccompanied_youth: true; race: 7+null; hispanic: true/false | 60 | — |
+| `shelter+parenting_youth+age` | es, th, unsheltered | parenting_youth: true; age_upper: 17, 24 | 6 | — |
+| `shelter+parenting_youth+gender` | es, th, sh, unsheltered | parenting_youth: true; gender: 8 values | 24 | — |
+| `shelter+parenting_youth+race+hispanic` | es, th, sh, unsheltered | parenting_youth: true; race: 7+null; hispanic: true/false | 45 | — |
+| `shelter+children_of_parenting_youth` | es, th, unsheltered | children_of_parenting_youth: true | 3 | — |
+| `shelter+chronic+in_family` | es, sh, unsheltered | chronic: true/false; in_family: true/false | 5 | 5 |
 
-Per-shelter-type totals broken down by household type. Covers all 14 household types across 4 atomic shelter types (with some gaps where certain shelter types do not serve certain populations, e.g., SH has no `family` or `parenting_youth`).
-
-**Shelter values:** `es`, `th`, `sh`, `unsheltered`
-**Household values:** `individual`, `family`, `family_households`, `veteran`, `unaccompanied_youth`, `unaccompanied_youth_under18`, `unaccompanied_youth_18_24`, `parenting_youth`, `parenting_youth_under18`, `parenting_youth_18_24`, `children_of_parenting_youth`, `chronically_homeless`, `chronically_homeless_individuals`, `chronically_homeless_family`
-
-Example retained columns:
-- `Sheltered ES Homeless Individuals`
-- `Sheltered ES Homeless People in Families`
-- `Sheltered ES Homeless Family Households`
-- `Sheltered ES Homeless Veterans`
-- `Sheltered ES Homeless Unaccompanied Youth (Under 25)`
-- `Sheltered ES Homeless Chronically Homeless`
-- `Unsheltered Homeless Parenting Youth (Under 25)`
-- `Unsheltered Homeless Children of Parenting Youth`
-
-### `shelter+household+age` — 56 columns
-
-Per-shelter-type, per-household-type counts broken down by age range. Available only for `individual` and `family` household types. Age data only populated from 2013 onward (see anomaly §5.1).
-
-**Shelter values:** `es`, `th`, `sh`, `unsheltered`
-**Household values:** `individual`, `family`
-**Age upper bounds:** 17, 24, 34, 44, 54, 64, 110 (and also 110 for `Over 24` in earlier years — see anomaly §5.1)
-
-Example retained columns:
-- `Sheltered ES Homeless Individuals - Under 18`
-- `Sheltered ES Homeless Individuals - Age 18 to 24`
-- `Unsheltered Homeless People in Families - Over 64`
-
-### `shelter+household+gender` — 144 columns
-
-Per-shelter-type, per-household-type counts broken down by gender. Available for `individual`, `family`, `veteran`, `unaccompanied_youth`, and `parenting_youth` household types.
-
-**Shelter values:** `es`, `th`, `sh`, `unsheltered`
-**Household values:** `individual`, `family`, `veteran`, `unaccompanied_youth`, `parenting_youth`
-**Gender values:** `woman`, `man`, `transgender`, `gender_questioning`, `non_binary`, `more_than_one_gender`, `culturally_specific_identity`, `different_identity`
-
-Example retained columns:
-- `Sheltered ES Homeless Individuals - Woman`
-- `Unsheltered Homeless Veterans - Transgender`
-- `Sheltered TH Homeless Unaccompanied Youth (Under 25) - Non Binary`
-
-### `shelter+household+race_only` — 144 columns
-
-Per-shelter-type, per-household-type counts for respondents who selected **only** that single racial identity (and are not Hispanic). This is the "race alone, non-Hispanic" count.
-
-**Shelter values:** `es`, `th`, `sh`, `unsheltered`
-**Household values:** `individual`, `family`, `veteran`, `unaccompanied_youth`, `parenting_youth`
-**Race values:** `american_indian_alaska_native_indigenous`, `asian`, `black`, `hispanic`, `middle_eastern_north_african`, `multi_racial`, `native_hawaiian_pacific_islander`, `white`
-
-Note: `hispanic` appears here as `Hispanic/Latina/e/o Only` — people who identified as Hispanic and no racial group.
-
-Example retained columns:
-- `Sheltered ES Homeless Individuals - Black, African American, or African Only`
-- `Unsheltered Homeless Veterans - White Only`
-- `Sheltered TH Homeless Unaccompanied Youth (Under 25) - Hispanic/Latina/e/o Only`
-
-### `shelter+household+race_and_hispanic` — 126 columns
-
-Per-shelter-type, per-household-type counts for respondents who selected **both** a racial identity **and** Hispanic/Latina/e/o. The `race` column value is the alphabetically sorted comma-separated pair (e.g., `black,hispanic`).
-
-**Shelter values:** `es`, `th`, `sh`, `unsheltered`
-**Household values:** `individual`, `family`, `veteran`, `unaccompanied_youth`, `parenting_youth`
-**Race values (combined):** `american_indian_alaska_native_indigenous,hispanic`, `asian,hispanic`, `black,hispanic`, `hispanic,middle_eastern_north_african`, `hispanic,multi_racial`, `hispanic,native_hawaiian_pacific_islander`, `hispanic,white`
-
-Note: This set has 126 columns (not 140) because `sh` is missing `family` and `parenting_youth`, reducing coverage for those combinations.
-
-Example retained columns:
-- `Sheltered ES Homeless Individuals - Black, African American, or African and Hispanic/Latina/e/o`
-- `Unsheltered Homeless Veterans - White and Hispanic/Latina/e/o`
-- `Sheltered TH Homeless Parenting Youth (Under 25) - American Indian, Alaska Native, or Indigenous and Hispanic/Latina/e/o`
+**Total source columns retained: 506.** Per year loaded, 5 additional `chronic=false` rows are derived from the `shelter+chronic+in_family` set (3 shelter types × individual + ES/unsheltered family; SH contributes individual-only).
 
 ---
 
 ## 9. Exclusion Rule
 
-The following rule is applied to identify redundant aggregate columns. A source column is **excluded** (placed in the redundant list) if **any** of the following conditions holds:
+A source column is excluded (placed in the redundant list) if **any** of the following holds:
 
-**Rule 1 — Aggregate shelter:** The column's shelter type is `overall` or `sheltered_total`.
-- `overall` = derivable as sum of `es` + `th` + `sh` + `unsheltered` (confirmed 2017, 2018, 2019, 2024).
-- `sheltered_total` = derivable as sum of `es` + `th` + `sh` (confirmed 2017, 2018, 2019, 2024).
+**R1 — Aggregate shelter:** Shelter type is `overall` or `sheltered_total`.
+- `overall` = es + th + sh + unsheltered (confirmed).
+- `sheltered_total` = es + th + sh (confirmed).
 
-**Rule 2 — Race(any) sub-dimension:** The column encodes a race breakdown using the "any-race" model (source column suffix is a plain race name without "Only" or "and Hispanic/Latina/e/o").
-- Derivable as: `race_only` + `race_and_hispanic` for the same race/shelter/household combination (confirmed 2024 for Black).
+**R2 — Race(any) sub-dimension:** Column suffix is a plain race name without `Only` or `and Hispanic/Latina/e/o`. Derivable as `(race=X, hispanic=false) + (race=X, hispanic=true)` (confirmed).
 
-**Rule 3 — Ethnicity sub-dimension:** The column encodes a Hispanic or Non-Hispanic ethnicity breakdown.
-- `Hispanic` = sum of all `race_and_hispanic` values + `Hispanic/Latina/e/o Only` (confirmed 2024).
-- `Non-Hispanic` = sum of all `race_only` values across all non-Hispanic races (confirmed 2024).
+**R3 — Ethnicity sub-dimension:** Column encodes `Hispanic/Latina/e/o` or `Non-Hispanic/Latina/e/o`. Derivable from the `hispanic` boolean rows (confirmed).
 
-**Rule 4 — No household filter with sub-dimension:** The column has an atomic shelter type (`es`, `th`, `sh`, `unsheltered`) but no household filter, and encodes a sub-dimension (age, gender, race_only, or race_and_hispanic).
-- Derivable as: `(same shelter + individual + same sub-dim)` + `(same shelter + family + same sub-dim)` (confirmed for ES, TH, Unsheltered 2024; SH family contribution is zero).
+**R4 — Atomic shelter, no household filter, with sub-dimension:** Shelter is atomic, no household type specified, and a sub-dimension (age/gender/race/hispanic) is present. Derivable as `(same shelter + individual + sub-dim) + (same shelter + family + sub-dim)` (confirmed; SH family contribution is zero).
 
-**Rule 5 — No household filter, no sub-dimension, atomic shelter:** The column is a plain total per atomic shelter type (e.g., `Sheltered ES Homeless`).
-- Derivable as: `(same shelter + individual)` + `(same shelter + family)` (confirmed for all four shelter types 2024).
+**R5 — Atomic shelter, no household filter, no sub-dimension:** Plain total per atomic shelter type. Derivable as `individual + family` (confirmed).
 
-**Re-application note:** When adding new yearly data sheets, apply these 5 rules to each new source column's parsed shelter, household, and sub-dimension values to determine inclusion/exclusion. The rules do not depend on data values — they depend purely on the column name structure.
+**R6 — Youth Under-25 aggregates (new):** Column is `Homeless Unaccompanied Youth (Under 25)` or `Homeless Parenting Youth (Under 25)` with **no sub-dimension**. Derivable as `under_18 + 18–24` for the same shelter type (confirmed 2021–2024).
 
-**Exception to Rule 4 (potential future data):** If a future year introduces columns with atomic shelter + no household + sub-dimension for a population where the individual/family partition does not cover the full total (e.g., if some people are not classified as either individual or family), Rule 4 would not apply and those columns should be retained. Always verify the `individual + family = total` identity holds before applying Rule 4 to new data.
+**R7 — Chronically Homeless aggregate (new):** Column is `Chronically Homeless` (no individual/family split) for a shelter type where both `Chronically Homeless Individuals` and `Chronically Homeless People in Families` exist (ES, SH, unsheltered). Derivable as `individuals + family` (confirmed). For SH: family component = 0.
+
+**Re-application note:** These rules depend purely on column name structure — not on data values — and can be applied mechanically to new yearly data. The only exception is R4/R5, which assume `individual + family = total`; verify this identity holds before applying to any new shelter/household combination introduced in future source data.
+
+---
+
+## 10. Complement Derivation
+
+After loading all source rows, derive implicit complement rows for dimensions where one side of an exhaustive partition is present in the source and the other can be safely computed by subtraction.
+
+### C1 — Chronic complement
+
+**Condition:** A shelter type has both a `chronic=true, in_family=X` source row and a corresponding `in_family=X` total row in the `shelter+in_family` dimension set.
+
+**Derivation:**
+```
+chronic=false count = in_family total (from shelter+in_family)
+                    − chronic=true count (from shelter+chronic+in_family)
+                    [for matching shelter and in_family values]
+```
+
+**Scope:** ES individual, ES family, SH individual, unsheltered individual, unsheltered family. TH is excluded (no chronic source data). SH family is excluded (no family rows for SH).
+
+**Verified safe (all complements positive, 2019–2024):**
+- ES non-chronic individuals: 298–842
+- ES non-chronic family: 190–254
+- SH non-chronic individuals: 3–12
+- Unsheltered non-chronic individuals: 3,796–5,108
+- Unsheltered non-chronic family: 24–290
+
+**Derived row attributes:**
+- `chronic = false`
+- `in_family` = same as the source row being complemented
+- `shelter` = same shelter type
+- `dimension_set = 'shelter+chronic+in_family'`
+- `is_derived = true`
+- `source_column = '<derived> <Shelter Prefix> Non-Chronically Homeless <Individuals|People in Families>'`
+- All other dimension columns null (consistent with the source `chronic=true` rows in this set)
+
+**Re-application:** When loading a new year, apply C1 after loading all source rows. Verify the complement is non-negative before inserting; a negative value would indicate a data anomaly in the source (chronic count exceeding total) and should be flagged rather than inserted.
+
+**No other complements currently derivable:**
+- `veteran=false` is not derivable — veteran counts are not split by `in_family`, so subtracting from `individual` or `family` totals would be incorrect.
+- `unaccompanied_youth=false` and `parenting_youth=false` are not meaningful analytic categories (the complement is the general homeless population minus a small cross-cut).
+- All gender, race/hispanic, and age dimension sets already form exhaustive partitions — both sides of every complement are already present in the source data.
+
+---
+
+## 11. Dimension Set Storage and Discovery
+
+### Two layers of information
+
+**Vocabulary** (what dimension sets are defined) is static — 16 sets, fixed by the data model, updated only when the model changes. Stored in a companion lookup table.
+
+**Coverage** (which sets have data for a given year) is empirical and varies heavily by year. Derived from the fact table, never hardcoded.
+
+---
+
+### Companion lookup table
+
+```sql
+CREATE TABLE pit_dimension_set_defs (
+    dimension_set  text    PRIMARY KEY,
+        -- matches the dimension_set column in pit_counts
+    dimensions     text[]  NOT NULL,
+        -- sorted array of dimension column names that are non-null in this set.
+        -- 'shelter' is always included (it is never null).
+        -- 'race' and 'hispanic' always appear together — treat as a single selection.
+    count_unit     text    NOT NULL DEFAULT 'person',
+        -- 'person'    = rows count individuals
+        -- 'household' = rows count household units (shelter+family_unit only)
+    description    text
+);
+
+INSERT INTO pit_dimension_set_defs
+    (dimension_set,                               dimensions,                                                  count_unit,  description)
+VALUES
+    ('shelter+in_family',                         ARRAY['in_family','shelter'],                                'person',    'Per-shelter totals split by individual vs. in-family (persons)'),
+    ('shelter+family_unit',                       ARRAY['in_family','shelter'],                                'household', 'Per-shelter count of family household units (not persons)'),
+    ('shelter+in_family+age',                     ARRAY['age','in_family','shelter'],                          'person',    'Individual/family persons by age range'),
+    ('shelter+in_family+gender',                  ARRAY['gender','in_family','shelter'],                       'person',    'Individual/family persons by gender'),
+    ('shelter+in_family+race+hispanic',           ARRAY['hispanic','in_family','race','shelter'],              'person',    'Individual/family persons by race and Hispanic ethnicity'),
+    ('shelter+veteran',                           ARRAY['shelter','veteran'],                                  'person',    'Veteran totals by shelter type'),
+    ('shelter+veteran+gender',                    ARRAY['gender','shelter','veteran'],                         'person',    'Veterans by gender'),
+    ('shelter+veteran+race+hispanic',             ARRAY['hispanic','race','shelter','veteran'],                'person',    'Veterans by race and Hispanic ethnicity'),
+    ('shelter+unaccompanied_youth+age',           ARRAY['age','shelter','unaccompanied_youth'],                'person',    'Unaccompanied youth by age sub-group (under 18 / 18-24)'),
+    ('shelter+unaccompanied_youth+gender',        ARRAY['gender','shelter','unaccompanied_youth'],             'person',    'Unaccompanied youth by gender'),
+    ('shelter+unaccompanied_youth+race+hispanic', ARRAY['hispanic','race','shelter','unaccompanied_youth'],    'person',    'Unaccompanied youth by race and Hispanic ethnicity'),
+    ('shelter+parenting_youth+age',               ARRAY['age','parenting_youth','shelter'],                   'person',    'Parenting youth by age sub-group (under 18 / 18-24)'),
+    ('shelter+parenting_youth+gender',            ARRAY['gender','parenting_youth','shelter'],                 'person',    'Parenting youth by gender'),
+    ('shelter+parenting_youth+race+hispanic',     ARRAY['hispanic','parenting_youth','race','shelter'],        'person',    'Parenting youth by race and Hispanic ethnicity'),
+    ('shelter+children_of_parenting_youth',       ARRAY['children_of_parenting_youth','shelter'],              'person',    'Children of parenting youth (no further sub-dimensions available)'),
+    ('shelter+chronic+in_family',                 ARRAY['chronic','in_family','shelter'],                      'person',    'Chronically vs. non-chronically homeless individuals/families');
+```
+
+**Note on `shelter+family_unit` vs `shelter+in_family`:** Both have `dimensions = ARRAY['in_family','shelter']` and are distinguished only by `count_unit`. Queries using array operators must include `AND count_unit = 'person'` when intending person counts. When constructing the tag string directly, the primary key is unambiguous.
+
+---
+
+### Coverage view
+
+Year/dimension availability is always derived from the fact table — never hardcoded:
+
+```sql
+CREATE MATERIALIZED VIEW pit_coverage AS
+SELECT year, dimension_set, count(*) AS row_count
+FROM pit_counts
+GROUP BY year, dimension_set
+ORDER BY year, dimension_set;
+```
+
+Refresh after each data load. To check whether a dimension set has data for a given year:
+
+```sql
+SELECT row_count FROM pit_coverage
+WHERE year = 2015 AND dimension_set = 'shelter+in_family+race+hispanic';
+-- no rows → not available for that year
+```
+
+---
+
+### Progressive disclosure: discovering compatible dimensions
+
+When a user selects one dimension, find which additional dimensions can be added:
+
+```sql
+-- User has selected 'veteran'. What other dimensions are available to add?
+SELECT DISTINCT unnest(dimensions) AS available_dimension
+FROM pit_dimension_set_defs
+WHERE 'veteran' = ANY(dimensions)
+  AND count_unit = 'person'
+ORDER BY 1;
+-- Returns: age, gender, hispanic, race, shelter, veteran
+-- Filter out already-selected ('veteran') and always-present ('shelter') in application code
+-- Offerable additions: gender, race+hispanic
+-- (age does not appear → correctly excluded, no veteran+age dimension set exists)
+```
+
+Because `race` and `hispanic` always appear together in every `dimensions` array, a UI should treat them as a single "race/ethnicity" option — selecting one implies the other. This co-occurrence can be verified:
+
+```sql
+-- Should return 0 rows if race and hispanic always co-occur:
+SELECT dimension_set FROM pit_dimension_set_defs
+WHERE ('race' = ANY(dimensions)) != ('hispanic' = ANY(dimensions));
+```
+
+---
+
+### Exact-match lookup: resolving a selection to a dimension set
+
+Given a set of selected dimensions, find the matching dimension set or confirm the combination is invalid:
+
+```sql
+-- User has selected veteran + gender. Find the dimension set:
+SELECT dimension_set
+FROM pit_dimension_set_defs
+WHERE dimensions @> ARRAY['shelter', 'veteran', 'gender']  -- must contain all of these
+  AND array_length(dimensions, 1) = 3                       -- and nothing else
+  AND count_unit = 'person';
+-- → 'shelter+veteran+gender'
+
+-- User tries veteran + age. Does this exist?
+SELECT dimension_set
+FROM pit_dimension_set_defs
+WHERE dimensions @> ARRAY['shelter', 'veteran', 'age']
+  AND array_length(dimensions, 1) = 3
+  AND count_unit = 'person';
+-- → (no rows) — invalid combination; UI should not offer 'age' after 'veteran' is selected
+```
+
+Alternatively, construct the `dimension_set` tag directly in application code (sort selected dimension names alphabetically, join with `+`) and use a primary-key lookup:
+
+```sql
+SELECT * FROM pit_dimension_set_defs WHERE dimension_set = 'shelter+veteran+gender';
+```
+
+This is simpler when the querier has already resolved their selections. The `@>` + `array_length` approach is better when validating combinations dynamically without constructing the tag string.
+
+---
+
+### Full progressive disclosure flow
+
+```
+1. User picks a population flag (e.g. veteran)
+      → WHERE 'veteran' = ANY(dimensions) AND count_unit = 'person'
+      → unnest all dimensions, exclude 'shelter' and already-selected dims
+      → offer to user: gender, race/ethnicity
+         (age correctly absent — no shelter+veteran+age set exists)
+
+2. User picks an additional dimension (e.g. gender)
+      → WHERE dimensions @> ARRAY['shelter','veteran','gender']
+             AND array_length(dimensions,1) = 3
+             AND count_unit = 'person'
+      → resolves to: dimension_set = 'shelter+veteran+gender'
+
+3. Optionally check year coverage before querying:
+      SELECT row_count FROM pit_coverage
+      WHERE year = 2023 AND dimension_set = 'shelter+veteran+gender';
+      -- if no row → data not available for this year
+
+4. Query the fact table:
+      SELECT shelter, gender, SUM(count)
+      FROM pit_counts
+      WHERE dimension_set = 'shelter+veteran+gender'
+        AND year = 2023
+      GROUP BY shelter, gender;
+```
 
 ---
 
 ## Appendix: Column Count Summary
 
+**Source column accounting:**
+
 | Category | Count |
 |---|---|
 | Total source columns | 1,309 |
-| Metadata columns (excluded from fact table) | 5 |
+| Metadata columns (excluded) | 5 |
 | Count columns analyzed | 1,304 |
-| Redundant — shelter=overall | 231 |
-| Redundant — shelter=sheltered_total | 231 |
-| Redundant — race(any) | 154 |
-| Redundant — ethnicity (Hispanic + Non-Hispanic) | 44 |
-| Redundant — atomic shelter, no household, with sub-dim | 124 |
-| Redundant — atomic shelter, no household, no sub-dim | 4 |
-| **Total redundant** | **788** |
-| **Retained (fact table)** | **516** |
+| Redundant — R1 shelter=overall | 231 |
+| Redundant — R1b shelter=sheltered_total | 231 |
+| Redundant — R2 race(any) | 154 |
+| Redundant — R3 ethnicity | 44 |
+| Redundant — R4 atomic shelter, no hh, with sub-dim | 124 |
+| Redundant — R5 atomic shelter, no hh, no sub-dim | 4 |
+| Redundant — R6 youth Under-25 aggregates | 7 |
+| Redundant — R7 chronically homeless aggregates | 3 |
+| **Total redundant** | **798** |
+| **Retained source columns** | **506** |
+
+**Retained dimension sets:** 16 (split `shelter+in_family` into person and household-unit sets relative to prior draft).
+
+**Fact table rows per year loaded** (approximate, varies by year data availability):
+- Source rows: up to 506, but far fewer in practice for most years — null source values are omitted entirely rather than inserted as count=0 (see design principle 4).
+- Derived rows (C1 chronic complement): 5 per year where chronic data exists (2013+); omitted for years where the source chronic column is null.
+- Total: up to 511 rows per year (2023–2024); substantially fewer for earlier years.
+
+**Year coverage summary for major dimension sets:**
+
+| Dimension set | First available | Notes |
+|---|---|---|
+| `shelter+in_family` | 2007 | Core totals present all years |
+| `shelter+family_unit` | ~2007 | Family household unit counts |
+| `shelter+in_family+age` | 2013 | Only 3 age buckets (17, 24, 110) until 2023; full 7 buckets from 2023 |
+| `shelter+in_family+gender` | ~2013 | Absent 2007–2012 |
+| `shelter+in_family+race+hispanic` | ~2013 | Absent 2007–2012 |
+| `shelter+veteran` | ~2007 | Coverage varies |
+| `shelter+veteran+gender` / `+race+hispanic` | ~2013 | Absent earlier years |
+| `shelter+unaccompanied_youth+age` | ~2013 | |
+| `shelter+unaccompanied_youth+gender` / `+race+hispanic` | ~2013 | |
+| `shelter+parenting_youth+*` | ~2013 | |
+| `shelter+children_of_parenting_youth` | ~2013 | |
+| `shelter+chronic+in_family` | ~2013 | Derived complement also starts ~2013 |
+
+Exact first-available years vary by column; consult the source data for authoritative per-column null patterns.
