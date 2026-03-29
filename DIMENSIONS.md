@@ -205,7 +205,7 @@ Chronic breakdowns exist only for `es`, `sh`, and `unsheltered`. `Sheltered TH C
 
 All rows count persons except rows derived from `Homeless Family Households` source columns, which count household units (family groups), not individuals. Example: `Overall Homeless Family Households = 237` while `Overall Homeless People in Families = 699` (2024) — these measure different things and cannot be summed.
 
-`count_unit = 'household'` rows have `in_family = true` and belong to the dedicated `shelter+family_unit` dimension set (3 source columns: ES, TH, unsheltered — SH has no family rows). They are kept separate from `shelter+in_family`, which contains only person-count rows, so that `SUM(count) WHERE dimension_set = 'shelter+in_family'` is always a homogeneous person total.
+`count_unit = 'household'` rows have `in_family = true` and belong to the dedicated `shelter+family_unit` dimension set (3 source columns: ES, TH, unsheltered — SH has no family rows). They are kept separate from `shelter+in_family`, which contains only person-count rows, so that `SUM(n) WHERE dimension_set = 'shelter+in_family'` is always a homogeneous person total.
 
 ---
 
@@ -394,7 +394,7 @@ After applying all exclusion rules (§9) and adopting the unbundled dimension mo
 **Total retained source columns: 506.** The fact table will contain additional derived rows (see §10): 5 `chronic=false` rows per year derived from the `shelter+chronic+in_family` set.
 
 **Notes on dimension set structure:**
-- `shelter+in_family` is **7 columns** (person counts only): 4 individual (all shelter types) + 3 family person (ES, TH, unsheltered — SH has no family). `SUM(count) WHERE dimension_set = 'shelter+in_family'` is always a homogeneous person total.
+- `shelter+in_family` is **7 columns** (person counts only): 4 individual (all shelter types) + 3 family person (ES, TH, unsheltered — SH has no family). `SUM(n) WHERE dimension_set = 'shelter+in_family'` is always a homogeneous person total.
 - `shelter+family_unit` is the dedicated set for the 3 `Family Households` source columns (count_unit='household'). Never mix with `shelter+in_family` in aggregations.
 - `shelter+in_family+race+hispanic` merges what were previously two dimension sets (`race_only` and `race_and_hispanic`). The `hispanic` boolean cleanly distinguishes them.
 - `shelter+unaccompanied_youth+gender` and `shelter+parenting_youth+gender` retain the Under-25 aggregate population for gender/race breakdowns — those aggregate rows are not redundant (no finer gender/race breakdown exists within youth). Only the bare totals with no sub-dimension (R6) are excluded.
@@ -498,8 +498,8 @@ CREATE TABLE pit_counts (
         -- false = respondent did not identify as Hispanic/Latina/e/o (race-only rows)
         -- null  = row is not disaggregated by ethnicity
 
-    -- Count
-    count                 int      NOT NULL,
+    -- Count value. Named `n` (not `count`) to avoid PostgREST's reserved aggregate keyword.
+    n                     int      NOT NULL,
 
     -- Count unit (all rows are person-counts except family_households source rows)
     count_unit            text     NOT NULL DEFAULT 'person',

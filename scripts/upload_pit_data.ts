@@ -9,7 +9,7 @@
  *   npx tsx scripts/upload_pit_data.ts [--dry-run]
  *
  * Requires .env.local with:
- *   SUPABASE_URL=https://<project>.supabase.co
+ *   NEXT_PUBLIC_SUPABASE_URL=https://<project>.supabase.co
  *   SUPABASE_SECRET_KEY=<secret-key>
  */
 
@@ -30,14 +30,14 @@ const DRY_RUN = process.argv.includes('--dry-run');
 
 dotenv.config({ path: path.resolve(__dirname, '../.env.local') });
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
+const NEXT_PUBLIC_SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
-if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
-  console.error('Missing SUPABASE_URL or SUPABASE_SECRET_KEY in .env.local');
+if (!NEXT_PUBLIC_SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+  console.error('Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SECRET_KEY in .env.local');
   process.exit(1);
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
+const supabase = createClient(NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SECRET_KEY);
 
 // ---------------------------------------------------------------------------
 // Types
@@ -60,7 +60,7 @@ interface PitRow {
   gender: string | null;
   race: string | null;
   hispanic: boolean | null;
-  count: number;
+  n: number;
   count_unit: CountUnit;
   dimension_set: string;
   source_column: string;
@@ -116,7 +116,7 @@ const GENDER_MAP: Record<string, string> = {
 function parseColumn(
   colName: string,
   year: number,
-): Omit<PitRow, 'year' | 'coc_id' | 'count'> | null {
+): Omit<PitRow, 'year' | 'coc_id' | 'n'> | null {
 
   // --- Step 1: Extract shelter prefix (R1 and R1b) ---
   let shelter: Shelter;
@@ -419,7 +419,7 @@ async function main() {
       sourceRows.push({
         year,
         coc_id,
-        count,
+        n: count,
         ...parsed,
       });
     }
@@ -437,21 +437,21 @@ async function main() {
   for (const row of sourceRows) {
     if (row.dimension_set === 'shelter+in_family' && row.count_unit === 'person') {
       const key = `${row.year}|${row.coc_id}|${row.shelter}|${String(row.in_family)}`;
-      totalByKey.set(key, row.count);
+      totalByKey.set(key, row.n);
     }
   }
 
   // Build lookup: (year, coc_id, shelter, in_family) → chronic=true count
-  const chronicByKey = new Map<string, { count: number; sourceCol: string }>();
+  const chronicByKey = new Map<string, { n: number; sourceCol: string }>();
   for (const row of sourceRows) {
     if (row.dimension_set === 'shelter+chronic+in_family' && row.chronic === true) {
       const key = `${row.year}|${row.coc_id}|${row.shelter}|${String(row.in_family)}`;
-      chronicByKey.set(key, { count: row.count, sourceCol: row.source_column });
+      chronicByKey.set(key, { n: row.n, sourceCol: row.source_column });
     }
   }
 
   const derivedRows: PitRow[] = [];
-  for (const [key, { count: chronicCount }] of chronicByKey.entries()) {
+  for (const [key, { n: chronicCount }] of chronicByKey.entries()) {
     const total = totalByKey.get(key);
     if (total === undefined) {
       console.warn(`  C1: No total found for chronic complement key: ${key}`);
@@ -486,7 +486,7 @@ async function main() {
       gender: null,
       race: null,
       hispanic: null,
-      count: nonChronicCount,
+      n: nonChronicCount,
       count_unit: 'person',
       dimension_set: 'shelter+chronic+in_family',
       source_column: sourceColumn,
